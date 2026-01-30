@@ -100,6 +100,11 @@ final class GeometryUtils
 
     private static function pointOnSegment(float $x, float $y, float $x1, float $y1, float $x2, float $y2): bool
     {
+        $lenSq = ($x2 - $x1) ** 2 + ($y2 - $y1) ** 2;
+        if ($lenSq === 0.0) {
+            return abs($x - $x1) <= 1e-12 && abs($y - $y1) <= 1e-12;
+        }
+
         $cross = ($x - $x1) * ($y2 - $y1) - ($y - $y1) * ($x2 - $x1);
         if (abs($cross) > 1e-12) {
             return false;
@@ -110,7 +115,6 @@ final class GeometryUtils
             return false;
         }
 
-        $lenSq = ($x2 - $x1) ** 2 + ($y2 - $y1) ** 2;
         if ($dot > $lenSq) {
             return false;
         }
