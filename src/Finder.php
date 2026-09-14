@@ -60,7 +60,12 @@ final class Finder
 
     private static function boundedStore(int $maxItems): ArrayAdapter
     {
-        return new ArrayAdapter(defaultLifetime: 0, storeSerialized: true, maxLifetime: 0, maxItems: $maxItems);
+        // Positional, deliberately. Symfony renamed the second constructor
+        // parameter between 8.0 ($storeSerialized) and 8.1 ($deepClone), so a
+        // named argument blows up at runtime on whichever version the consumer
+        // happens to resolve. The order and meaning are stable across ^8:
+        // (defaultLifetime, storeSerialized|deepClone, maxLifetime, maxItems).
+        return new ArrayAdapter(0, true, 0, $maxItems);
     }
 
     public function preCache(): void

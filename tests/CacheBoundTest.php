@@ -32,7 +32,7 @@ final class CacheBoundTest extends TestCase
 
     public function testCacheHonoursTheConfiguredBound(): void
     {
-        $adapter = new ArrayAdapter(defaultLifetime: 0, storeSerialized: true, maxLifetime: 0, maxItems: 8);
+        $adapter = new ArrayAdapter(0, true, 0, 8);
         $finder = FinderFactory::forDataset(FinderFactory::DATASET_ALL);
         $finder->setCache(['store' => $adapter]);
 
