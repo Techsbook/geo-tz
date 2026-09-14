@@ -12,6 +12,18 @@ use Symfony\Component\Cache\Psr16Cache;
 
 final class Finder
 {
+    /**
+     * Decoded features are cached per quad. Left unbounded that cache grows until
+     * every quad in the dataset is resident, which for the full dataset is close
+     * to 2GB - a cost paid by every long-lived process, since nothing ever
+     * evicts. Bounding it keeps the win (repeat lookups of the same place stay
+     * fast) while capping the worst case at the size of the cap.
+     *
+     * 256 entries comfortably covers the hot set of a typical workload, where
+     * requests cluster on populated places.
+     */
+    public const DEFAULT_CACHE_ITEMS = 256;
+
     /** @var array<string, mixed> */
     private array $tzData;
     private string $featureFilePath;
@@ -24,20 +36,31 @@ final class Finder
     {
         $this->tzData = $tzData;
         $this->featureFilePath = $featureFilePath;
-        $this->featureCache = new Psr16Cache(new ArrayAdapter());
+        $this->featureCache = new Psr16Cache(self::boundedStore(self::DEFAULT_CACHE_ITEMS));
     }
 
     /**
-     * @param array{preload?: bool, store?: object} $options
+     * @param array{preload?: bool, store?: object, maxItems?: int} $options
+     *        maxItems caps the in-memory feature cache; 0 means unbounded.
+     *        Defaults to DEFAULT_CACHE_ITEMS, or unbounded when preload is set,
+     *        since preloading into a bounded cache would just evict as it goes.
      */
     public function setCache(?array $options = null): void
     {
-        $store = $this->resolveCacheStore($options['store'] ?? null);
+        $preload = !empty($options['preload']);
+        $maxItems = $options['maxItems'] ?? ($preload ? 0 : self::DEFAULT_CACHE_ITEMS);
+
+        $store = $this->resolveCacheStore($options['store'] ?? null, (int) $maxItems);
         $this->featureCache = $store;
 
-        if (!empty($options['preload'])) {
+        if ($preload) {
             $this->preCache();
         }
+    }
+
+    private static function boundedStore(int $maxItems): ArrayAdapter
+    {
+        return new ArrayAdapter(defaultLifetime: 0, storeSerialized: true, maxLifetime: 0, maxItems: $maxItems);
     }
 
     public function preCache(): void
@@ -53,7 +76,7 @@ final class Finder
         return $this->findUsingDataset($lat, $lon);
     }
 
-    private function resolveCacheStore(mixed $store): CacheInterface
+    private function resolveCacheStore(mixed $store, int $maxItems = self::DEFAULT_CACHE_ITEMS): CacheInterface
     {
         if ($store instanceof CacheInterface) {
             return $store;
@@ -64,7 +87,7 @@ final class Finder
         }
 
         if ($store === null) {
-            return new Psr16Cache(new ArrayAdapter());
+            return new Psr16Cache(self::boundedStore($maxItems));
         }
 
         throw new \InvalidArgumentException('Cache store must implement Psr\\SimpleCache\\CacheInterface or Psr\\Cache\\CacheItemPoolInterface');
