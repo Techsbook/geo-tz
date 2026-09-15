@@ -24,11 +24,16 @@ final class Finder
      *
      * With the index itself no longer resident (see {@see PackedIndex}) this cap
      * is what sets a worker's steady-state footprint, and under FrankenPHP it is
-     * paid per thread. 64 still covers the hot set of a clustered workload while
-     * leaving room for a high thread count; raise it with setCache(['maxItems'
-     * => n]) if you run few threads and want the extra hit rate.
+     * paid per thread - so the right value depends on how many threads the
+     * deployment runs, which the library cannot know. Set `GEO_TZ_CACHE_ITEMS`
+     * to override it without a code change; 64 is the fallback.
      */
     public const DEFAULT_CACHE_ITEMS = 64;
+
+    /**
+     * Environment override for {@see DEFAULT_CACHE_ITEMS}. `0` means unbounded.
+     */
+    public const CACHE_ITEMS_ENV = 'GEO_TZ_CACHE_ITEMS';
 
     private Index $index;
     private string $featureFilePath;
@@ -47,19 +52,40 @@ final class Finder
         };
 
         $this->featureFilePath = $featureFilePath;
-        $this->featureCache = new Psr16Cache(self::boundedStore(self::DEFAULT_CACHE_ITEMS));
+        $this->featureCache = new Psr16Cache(self::boundedStore(self::defaultMaxItems()));
+    }
+
+    /**
+     * The configured cache bound: `GEO_TZ_CACHE_ITEMS` if it is a sane value,
+     * otherwise {@see DEFAULT_CACHE_ITEMS}.
+     *
+     * A malformed value falls back rather than throwing. This is read while a
+     * worker boots, and taking the service down over a typo in an env var is a
+     * worse failure than quietly using the default.
+     */
+    public static function defaultMaxItems(): int
+    {
+        $configured = getenv(self::CACHE_ITEMS_ENV);
+
+        if (!is_string($configured) || !preg_match('/^\d+$/', trim($configured))) {
+            return self::DEFAULT_CACHE_ITEMS;
+        }
+
+        return (int) trim($configured);
     }
 
     /**
      * @param array{preload?: bool, store?: object, maxItems?: int} $options
-     *        maxItems caps the in-memory feature cache; 0 means unbounded.
-     *        Defaults to DEFAULT_CACHE_ITEMS, or unbounded when preload is set,
-     *        since preloading into a bounded cache would just evict as it goes.
+     *        maxItems caps the in-memory feature cache; 0 means unbounded. An
+     *        explicit value wins over `GEO_TZ_CACHE_ITEMS`; otherwise the
+     *        environment decides, falling back to DEFAULT_CACHE_ITEMS. Preload
+     *        is unbounded unless capped explicitly, since preloading into a
+     *        bounded cache would just evict as it goes.
      */
     public function setCache(?array $options = null): void
     {
         $preload = !empty($options['preload']);
-        $maxItems = $options['maxItems'] ?? ($preload ? 0 : self::DEFAULT_CACHE_ITEMS);
+        $maxItems = $options['maxItems'] ?? ($preload ? 0 : self::defaultMaxItems());
 
         $store = $this->resolveCacheStore($options['store'] ?? null, (int) $maxItems);
         $this->featureCache = $store;
@@ -101,7 +127,7 @@ final class Finder
         return $this->findUsingDataset($lat, $lon);
     }
 
-    private function resolveCacheStore(mixed $store, int $maxItems = self::DEFAULT_CACHE_ITEMS): CacheInterface
+    private function resolveCacheStore(mixed $store, int $maxItems): CacheInterface
     {
         if ($store instanceof CacheInterface) {
             return $store;

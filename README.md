@@ -59,6 +59,47 @@ keeps every quad it has ever touched, and the full dataset has 21,525 of them -
 roughly **2GB** once saturated. Real traffic clusters on populated places, so a
 small cache loses very little.
 
+The entries are decoded quads, not megabytes, and they vary in size with how
+complex the local borders are. Since the right bound depends on how many threads
+the deployment runs - something the library cannot know - it is settable from
+the environment:
+
+```bash
+GEO_TZ_CACHE_ITEMS=16    # tighter, for high thread counts
+GEO_TZ_CACHE_ITEMS=0     # unbounded
+```
+
+An explicit `setCache(['maxItems' => n])` still wins over the environment, and a
+malformed value falls back to the default rather than throwing - taking a
+service down over a typo in an env var is the worse failure.
+
+Lowering it costs very little speed. Measured in a single process over 6,000
+clustered lookups on the full dataset:
+
+| maxItems | Per lookup | Arena |
+|---|---|---|
+| 256 | 0.0339 ms | 14.0 MB |
+| 64 (default) | 0.0390 ms | 4.0 MB |
+| 16 | 0.0411 ms | 2.0 MB |
+| 4 | 0.0507 ms | 4.0 MB |
+
+Going from 64 to 16 costs about 2 microseconds per lookup - well under 1% of the
+time an HTTP request around it takes.
+
+What actually decides both speed and memory is whether the working set fits, not
+the size of the bound. Measured behind FrankenPHP at 40 worker threads:
+
+| Traffic | Hit rate | Mean request | Resident |
+|---|---|---|---|
+| Repeating a bounded set of places | 99% | 0.56 ms | 178 MB |
+| Scattered widely over the globe | 5% | 5.07 ms | 1116 MB |
+
+Under the first, every bound from 16 to 256 performs identically - the hot quads
+fit in all of them. Under the second the cache cannot help whatever its size,
+and a larger bound only means each thread retains more of what it will not reuse.
+So size this for the worst case you are willing to pay for, not for the hit rate
+you hope to get.
+
 Measured on the full dataset, 8,000 clustered lookups, one process per row:
 
 | Index | Cache | Index resident | Steady state | Per lookup |
@@ -140,3 +181,6 @@ files if you want to store them outside the package. Both the index and the
 
 `scripts/pack-index.php` honours the same variable, and writes the packed index
 next to the JSON it was built from.
+
+Set `GEO_TZ_CACHE_ITEMS` to bound the in-memory feature cache - see the memory
+section above. Unset, it defaults to 64.
