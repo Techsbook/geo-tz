@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace GeoTz;
 
 use GeoTz\GeoBuf\Decoder as GeoBufDecoder;
+use GeoTz\Index\ArrayIndex;
+use GeoTz\Index\Index;
+use GeoTz\Index\PackedIndex;
 use Psr\Cache\CacheItemPoolInterface;
 use Psr\SimpleCache\CacheInterface;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
@@ -19,22 +22,30 @@ final class Finder
      * evicts. Bounding it keeps the win (repeat lookups of the same place stay
      * fast) while capping the worst case at the size of the cap.
      *
-     * 256 entries comfortably covers the hot set of a typical workload, where
-     * requests cluster on populated places.
+     * With the index itself no longer resident (see {@see PackedIndex}) this cap
+     * is what sets a worker's steady-state footprint, and under FrankenPHP it is
+     * paid per thread. 64 still covers the hot set of a clustered workload while
+     * leaving room for a high thread count; raise it with setCache(['maxItems'
+     * => n]) if you run few threads and want the extra hit rate.
      */
-    public const DEFAULT_CACHE_ITEMS = 256;
+    public const DEFAULT_CACHE_ITEMS = 64;
 
-    /** @var array<string, mixed> */
-    private array $tzData;
+    private Index $index;
     private string $featureFilePath;
     private CacheInterface $featureCache;
 
     /**
-     * @param array<string, mixed> $tzData
+     * @param array<string, mixed>|string|Index $index a decoded index.json, the
+     *        path to a packed .index.bin, or a ready-made index
      */
-    public function __construct(array $tzData, string $featureFilePath)
+    public function __construct(array|string|Index $index, string $featureFilePath)
     {
-        $this->tzData = $tzData;
+        $this->index = match (true) {
+            $index instanceof Index => $index,
+            is_string($index) => new PackedIndex($index),
+            default => new ArrayIndex($index),
+        };
+
         $this->featureFilePath = $featureFilePath;
         $this->featureCache = new Psr16Cache(self::boundedStore(self::DEFAULT_CACHE_ITEMS));
     }
@@ -68,9 +79,18 @@ final class Finder
         return new ArrayAdapter(0, true, 0, $maxItems);
     }
 
+    /**
+     * Decode every quad's features into the cache up front.
+     *
+     * This is the opposite trade to the packed index: it buys lookup latency
+     * with several hundred MB of resident memory. Only worth it for a
+     * single-process, lookup-heavy job.
+     */
     public function preCache(): void
     {
-        $this->preCacheRecursive($this->tzData['lookup'], '');
+        $this->index->eachFeatureNode(function (string $quadPos, int $pos, int $len): void {
+            $this->featureCache->set($quadPos, $this->loadFeatures($pos, $len));
+        });
     }
 
     /**
@@ -96,25 +116,6 @@ final class Finder
         }
 
         throw new \InvalidArgumentException('Cache store must implement Psr\\SimpleCache\\CacheInterface or Psr\\Cache\\CacheItemPoolInterface');
-    }
-
-    private function preCacheRecursive(mixed $curTzData, string $quadPos): void
-    {
-        if (!is_array($curTzData)) {
-            return;
-        }
-
-        if (isset($curTzData['pos'], $curTzData['len']) && $curTzData['pos'] >= 0) {
-            $geoJson = $this->loadFeatures((int) $curTzData['pos'], (int) $curTzData['len']);
-            $this->featureCache->set($quadPos, $geoJson);
-            return;
-        }
-
-        foreach ($curTzData as $key => $value) {
-            if (is_string($key)) {
-                $this->preCacheRecursive($value, $quadPos . $key);
-            }
-        }
     }
 
     /**
@@ -157,7 +158,7 @@ final class Finder
             'midLon' => 0.0,
         ];
         $quadPos = '';
-        $curTzData = $this->tzData['lookup'];
+        $node = $this->index->rootNode();
 
         while (true) {
             if ($lat >= $quadData['midLat'] && $lon >= $quadData['midLon']) {
@@ -178,17 +179,20 @@ final class Finder
                 $quadData['left'] = $quadData['midLon'];
             }
 
-            $curTzData = is_array($curTzData) ? ($curTzData[$nextQuad] ?? null) : null;
+            $child = $node['kind'] === Index::BRANCH ? ($node['children'][$nextQuad] ?? null) : null;
             $quadPos .= $nextQuad;
 
-            if ($curTzData === null) {
+            // No child means the quad holds no land at all.
+            if ($child === null) {
                 return OceanUtils::getTimezoneAtSea($originalLon);
             }
 
-            if (is_array($curTzData) && isset($curTzData['pos'], $curTzData['len']) && $curTzData['pos'] >= 0) {
+            $node = $this->index->node($child);
+
+            if ($node['kind'] === Index::FEATURE) {
                 $geoJson = $this->featureCache->get($quadPos);
                 if ($geoJson === null) {
-                    $geoJson = $this->loadFeatures((int) $curTzData['pos'], (int) $curTzData['len']);
+                    $geoJson = $this->loadFeatures($node['pos'], $node['len']);
                     $this->featureCache->set($quadPos, $geoJson);
                 }
 
@@ -203,21 +207,16 @@ final class Finder
 
                 $timezonesContainingPoint = array_values(array_filter($timezonesContainingPoint, static fn ($tzid) => $tzid !== null));
 
+                // The quad has land in it, but not under this point.
                 return count($timezonesContainingPoint) > 0
                     ? $timezonesContainingPoint
                     : OceanUtils::getTimezoneAtSea($originalLon);
             }
 
-            if (is_array($curTzData) && array_is_list($curTzData) && count($curTzData) > 0) {
-                $timezones = [];
-                foreach ($curTzData as $idx) {
-                    $timezones[] = $this->tzData['timezones'][$idx] ?? null;
-                }
-                return array_values(array_filter($timezones, static fn ($tzid) => $tzid !== null));
-            }
-
-            if (!is_array($curTzData)) {
-                throw new \RuntimeException('Unexpected data type');
+            // The quad is wholly inside its timezone(s), so there is nothing to
+            // test the point against.
+            if ($node['kind'] === Index::ZONES) {
+                return $node['zones'];
             }
 
             $quadData['midLat'] = ($quadData['top'] + $quadData['bottom']) / 2;

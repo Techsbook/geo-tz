@@ -55,6 +55,30 @@ try {
         downloadFile($url, $dest, $context);
     }
 
+    // Any packed index still on disk was built from the data we have just
+    // replaced, and it holds byte offsets into the old geo.dat. The library
+    // prefers the packed file when it is present, so a stale one would be read
+    // in preference to the correct JSON and would answer from the wrong offsets.
+    // Clear them before packing: if the pack below fails, the library falls back
+    // to the freshly downloaded JSON rather than trusting something wrong.
+    foreach (glob($dataDir . '/*.geojson.index.bin') ?: [] as $stale) {
+        unlink($stale);
+    }
+
+    echo "Packing indexes...\n";
+    $packer = __DIR__ . '/pack-index.php';
+    // Pin the packer to the directory we just downloaded into, so an ambient
+    // GEO_TZ_DATA_PATH cannot send the two halves to different places.
+    passthru(sprintf(
+        'GEO_TZ_DATA_PATH=%s %s %s',
+        escapeshellarg($dataDir),
+        escapeshellarg(PHP_BINARY),
+        escapeshellarg($packer)
+    ), $packStatus);
+    if ($packStatus !== 0) {
+        throw new RuntimeException('pack-index.php failed; the packed indexes have not been written');
+    }
+
     $metaUrl = "https://api.github.com/repos/{$repo}/commits/{$branch}";
     $metaJson = file_get_contents($metaUrl, false, $context);
     $meta = $metaJson ? json_decode($metaJson, true) : null;

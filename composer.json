@@ -23,6 +23,7 @@
   },
   "scripts": {
     "test": "phpunit",
-    "update-data": "php scripts/update-data.php"
+    "update-data": "php scripts/update-data.php",
+    "pack-index": "php scripts/pack-index.php"
   }
 }
